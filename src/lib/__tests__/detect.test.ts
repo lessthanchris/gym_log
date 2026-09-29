@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeDetection, normalizeHex } from "../detect";
+import { extractJson, normalizeDetection, normalizeHex, readOpenRouterStream } from "../detect";
 
 describe("normalizeDetection", () => {
   it("converts pixel boxes to normalized holds", () => {
@@ -33,5 +33,39 @@ describe("normalizeDetection", () => {
 describe("normalizeHex", () => {
   it("falls back to gray for junk", () => {
     expect(normalizeHex("orange")).toBe("#888888");
+  });
+});
+
+describe("extractJson", () => {
+  it("strips code fences and surrounding prose", () => {
+    expect(extractJson('Here you go:\n```json\n{"routes": []}\n```')).toBe('{"routes": []}');
+  });
+});
+
+describe("readOpenRouterStream", () => {
+  const streamOf = (...parts: string[]) =>
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        parts.forEach((p) => c.enqueue(new TextEncoder().encode(p)));
+        c.close();
+      },
+    });
+
+  it("joins content deltas split across chunks and skips keep-alives", async () => {
+    const result = await readOpenRouterStream(
+      streamOf(
+        ": OPENROUTER PROCESSING\n\n",
+        'data: {"choices":[{"delta":{"content":"{\\"rou"}}]}\n\ndata: {"choi',
+        'ces":[{"delta":{"content":"tes\\": []}"},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+      ),
+    );
+    expect(result).toEqual({ text: '{"routes": []}', finishReason: "stop" });
+  });
+
+  it("raises in-stream errors", async () => {
+    await expect(
+      readOpenRouterStream(streamOf('data: {"error":{"code":402,"message":"Insufficient credits"}}\n\n')),
+    ).rejects.toMatchObject({ status: 402, message: "Insufficient credits" });
   });
 });

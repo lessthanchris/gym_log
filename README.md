@@ -22,13 +22,15 @@ Requires Node.js 20.9+.
 
 ```bash
 npm install
-cp .env.example .env.local   # then set ANTHROPIC_API_KEY
+cp .env.example .env.local   # then set OPENROUTER_API_KEY (or ANTHROPIC_API_KEY)
 npm run dev                  # http://localhost:3000
 ```
 
 To use it from your phone at the gym, run it on a machine your phone can reach (`npm run build && npm start`) and open it by the host's address.
 
-Data lives in `./data` (SQLite database plus photos), or wherever `DATA_DIR` points. Detection uses `claude-opus-5-5` by default; set `ANTHROPIC_MODEL` to override.
+Data lives in `./data` (SQLite database plus photos), or wherever `DATA_DIR` points.
+
+Detection works with either key. With `OPENROUTER_API_KEY` it uses `anthropic/claude-opus-5.5` by default; set `OPENROUTER_MODEL` to try any other vision model on OpenRouter (use the ID shown on the model's OpenRouter page). With `ANTHROPIC_API_KEY` it calls Anthropic directly with `claude-opus-5-5` (override with `ANTHROPIC_MODEL`); if both keys are set, Anthropic is used.
 
 ## Development
 
@@ -40,7 +42,7 @@ npm run typecheck
 
 Layout:
 
-- `src/lib/detect.ts`: the Claude call (structured JSON output) and conversion of its pixel boxes to normalized hold boxes.
+- `src/lib/detect.ts`: the AI call (OpenRouter or Anthropic, structured JSON output) and conversion of its pixel boxes to normalized hold boxes.
 - `src/lib/db.ts`: SQLite schema and queries (walls, routes, holds, ascents).
 - `src/app/api/`: JSON route handlers used by the UI.
 - `src/components/WallCanvas.tsx`: photo with the SVG hold overlay, shared by the editor (`WallEditor`) and the climber view (`WallView`).

@@ -117,13 +117,38 @@ export function normalizeHex(value: string): string {
 
 export class DetectionError extends Error {}
 
-/** Ask Claude to find the routes and holds in a stored wall photo. */
+interface PreparedImage {
+  base64: string;
+  width: number;
+  height: number;
+}
+
+/**
+ * Find the routes and holds in a stored wall photo. Uses the Anthropic API when
+ * ANTHROPIC_API_KEY is set, otherwise OpenRouter when OPENROUTER_API_KEY is set.
+ */
 export async function detectRoutes(imagePath: string): Promise<DetectedRoute[]> {
   const { data, info } = await sharp(await fs.readFile(imagePath))
     .resize({ width: MODEL_MAX_EDGE, height: MODEL_MAX_EDGE, fit: "inside", withoutEnlargement: true })
     .jpeg({ quality: 90 })
     .toBuffer({ resolveWithObject: true });
+  const image = { base64: data.toString("base64"), width: info.width, height: info.height };
 
+  let text: string;
+  if (process.env.ANTHROPIC_API_KEY) text = await detectWithAnthropic(image);
+  else if (process.env.OPENROUTER_API_KEY) text = await detectWithOpenRouter(image, process.env.OPENROUTER_API_KEY);
+  else throw new DetectionError("No AI key configured. Set OPENROUTER_API_KEY or ANTHROPIC_API_KEY and retry.");
+
+  let parsed: RawDetection;
+  try {
+    parsed = RawDetection.parse(JSON.parse(extractJson(text)));
+  } catch {
+    throw new DetectionError("The AI returned a response that could not be read.");
+  }
+  return normalizeDetection(parsed, image.width, image.height);
+}
+
+async function detectWithAnthropic(image: PreparedImage): Promise<string> {
   const client = new Anthropic();
   // Streaming: a busy wall can produce a long list of boxes.
   const message = await client.beta.messages
@@ -141,8 +166,8 @@ export async function detectRoutes(imagePath: string): Promise<DetectedRoute[]> 
         {
           role: "user",
           content: [
-            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: data.toString("base64") } },
-            { type: "text", text: userPrompt(info.width, info.height) },
+            { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image.base64 } },
+            { type: "text", text: userPrompt(image.width, image.height) },
           ],
         },
       ],
@@ -155,12 +180,102 @@ export async function detectRoutes(imagePath: string): Promise<DetectedRoute[]> 
   if (message.stop_reason === "max_tokens") {
     throw new DetectionError("The wall had too many holds to list in one pass.");
   }
-  const text = message.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
-  let parsed: RawDetection;
-  try {
-    parsed = RawDetection.parse(JSON.parse(text));
-  } catch {
-    throw new DetectionError("Claude returned a response that could not be read.");
+  return message.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
+}
+
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL ?? "anthropic/claude-opus-5.5";
+
+/** A non-2xx response or in-stream error from OpenRouter. */
+export class OpenRouterError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
   }
-  return normalizeDetection(parsed, info.width, info.height);
+}
+
+async function detectWithOpenRouter(image: PreparedImage, apiKey: string): Promise<string> {
+  const res = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "X-Title": "Gym Log",
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      // Streamed so a long answer never trips an idle-connection timeout.
+      stream: true,
+      max_tokens: 32000,
+      reasoning: { effort: "high" },
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "wall_routes", strict: true, schema: DETECTION_SCHEMA },
+      },
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: `data:image/jpeg;base64,${image.base64}` } },
+            { type: "text", text: userPrompt(image.width, image.height) },
+          ],
+        },
+      ],
+    }),
+    signal: AbortSignal.timeout(10 * 60 * 1000),
+  });
+  if (!res.ok || !res.body) {
+    const body = await res.json().catch(() => null);
+    throw new OpenRouterError(res.status, body?.error?.message ?? res.statusText);
+  }
+
+  const { text, finishReason } = await readOpenRouterStream(res.body);
+  if (finishReason === "length") {
+    throw new DetectionError("The wall had too many holds to list in one pass.");
+  }
+  return text;
+}
+
+/** Collect the streamed text of an OpenAI-style server-sent-events response. */
+export async function readOpenRouterStream(
+  body: ReadableStream<Uint8Array>,
+): Promise<{ text: string; finishReason: string | null }> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let finishReason: string | null = null;
+
+  const handleLine = (line: string) => {
+    // Lines starting with ":" are keep-alive comments.
+    if (!line.startsWith("data:")) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    const chunk = JSON.parse(payload);
+    if (chunk.error) throw new OpenRouterError(Number(chunk.error.code) || 500, chunk.error.message ?? "Stream error");
+    const choice = chunk.choices?.[0];
+    if (typeof choice?.delta?.content === "string") text += choice.delta.content;
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
+  };
+
+  for await (const part of body as unknown as AsyncIterable<Uint8Array>) {
+    buffer += decoder.decode(part, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop()!;
+    lines.forEach((l) => handleLine(l.trimEnd()));
+  }
+  handleLine((buffer + decoder.decode()).trimEnd());
+  return { text, finishReason };
+}
+
+/**
+ * Pull the JSON object out of a model reply. Models that don't enforce the
+ * schema sometimes wrap it in a code fence or a sentence of prose.
+ */
+export function extractJson(text: string): string {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  return start >= 0 && end > start ? text.slice(start, end + 1) : text;
 }
